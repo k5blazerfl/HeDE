@@ -142,12 +142,4 @@ bool LauncherMenu::eventFilter(QObject *obj, QEvent *event) {
     return QWidget::eventFilter(obj, event);
 }
 
-bool LauncherMenu::event(QEvent *e) {
-    // Dismiss the Start menu when it loses focus (user clicked another window or
-    // the desktop) — but not while our own right-click actions popup is open.
-    if (e->type() == QEvent::WindowDeactivate && !QApplication::activePopupWidget())
-        qApp->quit();
-    return QWidget::event(e);
-}
-
 } // namespace helm
