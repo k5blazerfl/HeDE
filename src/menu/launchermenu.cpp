@@ -9,6 +9,7 @@
 #include <QListWidget>
 #include <QMenu>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QVBoxLayout>
 
 namespace helm {
@@ -16,6 +17,23 @@ namespace helm {
 static constexpr int kArgvRole = Qt::UserRole;
 static constexpr int kActionNamesRole = Qt::UserRole + 1;
 static constexpr int kActionExecsRole = Qt::UserRole + 2;
+
+// Launch a detached app WITHOUT leaking the menu's own layer-shell integration:
+// helm-menu sets QT_WAYLAND_SHELL_INTEGRATION=layer-shell for its own overlay, and
+// a plain QProcess::startDetached would pass it to the child — making that app's
+// main window map as a fullscreen, undecorated layer-shell surface. Strip it so
+// launched apps get a normal xdg-toplevel (titlebar, movable, sized by the app).
+static void launchDetached(const QStringList &argv) {
+    if (argv.isEmpty())
+        return;
+    QProcess proc;
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.remove(QStringLiteral("QT_WAYLAND_SHELL_INTEGRATION"));
+    proc.setProcessEnvironment(env);
+    proc.setProgram(argv.first());
+    proc.setArguments(argv.mid(1));
+    proc.startDetached();
+}
 
 LauncherMenu::LauncherMenu(QWidget *parent)
     : QWidget(parent), m_search(new QLineEdit(this)), m_list(new QListWidget(this)) {
@@ -70,7 +88,7 @@ void LauncherMenu::launch(QListWidgetItem *item) {
     const QStringList argv = item->data(kArgvRole).toStringList();
     if (argv.isEmpty())
         return;
-    QProcess::startDetached(argv.first(), argv.mid(1));
+    launchDetached(argv);
     qApp->quit();
 }
 
@@ -78,7 +96,7 @@ void LauncherMenu::run(const QString &exec) {
     const QStringList argv = commandArgv(exec);
     if (argv.isEmpty())
         return;
-    QProcess::startDetached(argv.first(), argv.mid(1));
+    launchDetached(argv);
     qApp->quit();
 }
 
