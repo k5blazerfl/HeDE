@@ -20,6 +20,7 @@ class LauncherMenu : public QWidget {
 
   protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
+    bool event(QEvent *event) override; // dismiss on focus loss (click-off)
 
   private slots:
     void showActions(const QPoint &pos); // right-click → jump-list actions
