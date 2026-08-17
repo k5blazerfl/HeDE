@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
-project(hede VERSION 0.0.0 LANGUAGES C CXX)
+project(hede VERSION 0.3.2 LANGUAGES C CXX)  # HeDE's own version line; the
+# release source of truth — mirror-hede.py / amphi-hede.py stamp the HeDE repo
+# tag and the gui-apps/hede ebuild from this. Bump it when cutting a HeDE change.
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,3 +37,8 @@ install(FILES data/wayland-sessions/hede.desktop
         DESTINATION ${CMAKE_INSTALL_PREFIX}/share/wayland-sessions)
 install(DIRECTORY data/labwc data/wayfire
         DESTINATION ${CMAKE_INSTALL_PREFIX}/share/hede)
+# The Helm labwc titlebar theme lands in the XDG theme search path
+# (/usr/share/themes) so labwc resolves <theme><name>Helm</name>. helm-theme
+# regenerates a per-user copy under ~/.local/share/themes that shadows this one.
+install(DIRECTORY data/themes
+        DESTINATION ${CMAKE_INSTALL_PREFIX}/share)

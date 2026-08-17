@@ -28,21 +28,6 @@ int main(int argc, char **argv) {
         /*exclusiveZone*/ 0, LayerShellQt::Window::KeyboardInteractivityOnDemand,
         QMargins(0, 0, 0, cfg.panelHeight()));
 
-    // Dismiss the Start menu when the app loses focus (user clicked another
-    // window or the desktop). A layer-shell Overlay doesn't get widget-level
-    // WindowDeactivate, so track application state instead: once we've been
-    // active, quit as soon as we go inactive (unless a child popup — the
-    // right-click actions menu — is what took focus).
-    QObject::connect(&app, &QApplication::applicationStateChanged, &app,
-                     [&app](Qt::ApplicationState state) {
-                         static bool wasActive = false;
-                         if (state == Qt::ApplicationActive) {
-                             wasActive = true;
-                         } else if (wasActive && !QApplication::activePopupWidget()) {
-                             app.quit();
-                         }
-                     });
-
     menu.show();
     return app.exec();
 }
