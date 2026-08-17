@@ -26,6 +26,49 @@ private slots:
         QCOMPARE(p.color(QPalette::Highlight), accent);
         QVERIFY(p.color(QPalette::Window).value() > 128); // still light
     }
+
+    void harborDefault() {
+        QCOMPARE(helm::harborAccent(), QColor(QStringLiteral("#3aa6c4")));
+    }
+
+    void styleSheetGlassBar() {
+        const QString qss = helm::styleSheet(false, helm::harborAccent());
+        QVERIFY(qss.contains(QStringLiteral("#HelmBar")));           // the glass bar
+        QVERIFY(qss.contains(QStringLiteral("Segoe UI")));           // familiar font
+        QVERIFY(qss.contains(QStringLiteral("rgba(11,38,46,0.82)"))); // bar_tint (navy glass)
+        // accent drives selection: Harbor #3aa6c4 → rgb(58,166,196) at 34%
+        QVERIFY(qss.contains(QStringLiteral("rgba(58,166,196,0.34)")));
+        // an invalid accent falls back to Harbor rather than producing an unstyled bar
+        QVERIFY(helm::styleSheet(false, QColor()).contains(QStringLiteral("rgba(58,166,196")));
+    }
+
+    void barGlyphAndStartTile() {
+        QCOMPARE(helm::barGlyphColor(), QColor(QStringLiteral("#eaf1f3")));
+        const QString qss = helm::styleSheet(false, helm::harborAccent());
+        QVERIFY(qss.contains(QStringLiteral("#HelmStart")));  // the ⎈ Start tile rule
+        QVERIFY(qss.contains(QStringLiteral("#eaf1f3")));     // glyph colour wired into the QSS
+    }
+
+    void tintedIconFallback() {
+        // A bogus theme name yields a null icon (graceful) rather than crashing.
+        QVERIFY(helm::tintedIcon(QStringLiteral("no-such-icon-zzz-000"), helm::barGlyphColor(),
+                                 QSize(18, 18))
+                    .isNull());
+    }
+
+    void acrylicPullout() {
+        const QString qss = helm::styleSheet(false, helm::harborAccent());
+        QVERIFY(qss.contains(QStringLiteral("#HelmPullout")));
+        QVERIFY(qss.contains(QStringLiteral("border-bottom: none")));        // flat bottom
+        QVERIFY(qss.contains(QStringLiteral("border-top-left-radius: 7px"))); // top corners only
+    }
+
+    void acrylicToast() {
+        const QString qss = helm::styleSheet(false, helm::harborAccent());
+        QVERIFY(qss.contains(QStringLiteral("#HelmToast")));
+        // the accent spine down the left edge (Harbor teal)
+        QVERIFY(qss.contains(QStringLiteral("border-left: 3px solid #3aa6c4")));
+    }
 };
 
 QTEST_MAIN(TestAppearance)
