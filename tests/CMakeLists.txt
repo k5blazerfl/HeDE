@@ -10,6 +10,14 @@ qt_add_executable(test-desktopentry test_desktopentry.cpp)
 target_link_libraries(test-desktopentry PRIVATE Qt6::Test helm-apps)
 add_test(NAME desktopentry COMMAND test-desktopentry)
 
+qt_add_executable(test-launcherstore test_launcherstore.cpp)
+target_link_libraries(test-launcherstore PRIVATE Qt6::Test helm-apps)
+add_test(NAME launcherstore COMMAND test-launcherstore)
+
+qt_add_executable(test-search test_search.cpp)
+target_link_libraries(test-search PRIVATE Qt6::Test helm-apps)
+add_test(NAME search COMMAND test-search)
+
 qt_add_executable(test-toplevelmodel test_toplevelmodel.cpp)
 target_link_libraries(test-toplevelmodel PRIVATE Qt6::Test helm-taskbar)
 add_test(NAME toplevelmodel COMMAND test-toplevelmodel)
@@ -48,6 +56,10 @@ add_test(NAME theme COMMAND test-theme)
 qt_add_executable(test-appearance test_appearance.cpp)
 target_link_libraries(test-appearance PRIVATE Qt6::Test helm-appearance)
 add_test(NAME appearance COMMAND test-appearance)
+
+qt_add_executable(test-menu test_menu.cpp)
+target_link_libraries(test-menu PRIVATE Qt6::Test helm-menu-lib)
+add_test(NAME menu COMMAND test-menu)
 
 # Headless integration: boot labwc (wlroots headless backend) and assert
 # helm-panel binds a layer-shell surface. Skips (77) when labwc is absent.

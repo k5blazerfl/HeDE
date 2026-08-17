@@ -22,11 +22,14 @@ SLOT="0"
 IUSE="wayfire" # opt-in "effects" compositor profile
 
 # Qt 6 Widgets + Wayland, the QtWayland client (foreign-toplevel protocol
-# bindings + qtwaylandscanner), and the layer-shell binding (the KF6 micro-dep).
+# bindings + qtwaylandscanner), and the layer-shell binding. layer-shell-qt is
+# mid-move between categories in ::gentoo (kde-plasma → kde-frameworks); accept
+# either so the ebuild resolves whatever the tree snapshot ships (an unsatisfiable
+# atom here silently makes emerge fall back to the old binpkg — see the bug note).
 DEPEND="
 	dev-qt/qtbase:6[dbus,widgets,wayland]
 	dev-qt/qtwayland:6
-	kde-frameworks/layer-shell-qt:6
+	|| ( kde-plasma/layer-shell-qt:6 kde-frameworks/layer-shell-qt:6 )
 "
 # Runtime: the compositor HeDE drives, the default terminal helm-panel spawns,
 # GeST (the Control Center + the org.gentoo.gest.Shell read seam), and a polkit
@@ -37,12 +40,15 @@ RDEPEND="
 	gui-apps/foot
 	app-admin/gest
 	lxqt-base/lxqt-policykit
-	app-misc/brightnessctl
 	media-video/wireplumber
 	gui-apps/swaylock
 	gui-apps/swayidle
 	wayfire? ( gui-wm/wayfire )
 "
+# The Wayland protocol code generator, needed at build time by Qt6WaylandClient
+# (find_package fails without it). ::gentoo split it out of dev-libs/wayland into
+# its own build-tool package, so it must be pulled explicitly.
+BDEPEND="dev-util/wayland-scanner"
 
 src_test() {
 	cmake_src_test
