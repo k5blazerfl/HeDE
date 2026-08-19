@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(hede VERSION 0.4.0 LANGUAGES C CXX)  # HeDE's own version line; the
+project(hede VERSION 0.4.1 LANGUAGES C CXX)  # HeDE's own version line; the
 # release source of truth — mirror-hede.py / amphi-hede.py stamp the HeDE repo
 # tag and the gui-apps/hede ebuild from this. Bump it when cutting a HeDE change.
 
@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Test WaylandClient DBus)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Test WaylandClient WaylandClientPrivate DBus)
 find_package(LayerShellQt REQUIRED)
 
 qt_standard_project_setup()
@@ -22,6 +22,7 @@ add_subdirectory(src/coreclient)
 add_subdirectory(src/quicksettings)
 add_subdirectory(src/media)
 add_subdirectory(src/theme)
+add_subdirectory(src/decoration)
 add_subdirectory(src/appearance)
 add_subdirectory(src/panel)
 add_subdirectory(src/menu)
