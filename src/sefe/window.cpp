@@ -1,18 +1,27 @@
 #include "window.h"
 
 #include "addressbar.h"
+#include "archivemodel.h" // hold: browse-in-place (Hold H3)
 #include "desktopentry.h" // helm-apps: scan + Exec argv (Open with)
 #include "holdcore.h"     // hold-core: archive extract/create (Hold H2)
+#include "config.h"       // helm::Config: throbber intensity knob
 #include "iconprovider.h"
 #include "launch.h"       // helm-common: launchDetached
 #include "ops.h"
+#include "palette.h"      // helm::effectiveAccent (scene-less fallback fill)
 #include "sefe.h"
+#include "throbber.h"     // HelmThrobber: the Netscape-style busy light
+#include "titlebar.h"     // HelmTitleBar: the client-side titlebar (frameless chrome)
+#include "world.h"        // helm::loadWorld: the active biome's wallpaper scene
 
 #include <QAbstractItemView>
 #include <QDialogButtonBox>
 #include <QAction>
 #include <QApplication>
 #include <QClipboard>
+#include <QThread>
+#include <QSizePolicy>
+#include <utility>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDialog>
@@ -28,10 +37,18 @@
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
+#include <QLinearGradient>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPaintEvent>
+#include <QWindow>
 #include <QListView>
 #include <QListWidget>
 #include <QLocale>
 #include <QMenu>
+#include <QMenuBar>
+#include <QMessageBox>
 #include <QMimeData>
 #include <QMimeDatabase>
 #include <QModelIndex>
@@ -40,6 +57,7 @@
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
+#include <QTemporaryDir>
 #include <QToolBar>
 #include <QTreeView>
 #include <QUrl>
@@ -58,8 +76,14 @@ QSet<QString> entriesOf(const QString &dir) {
 }
 } // namespace
 
-SefeWindow::SefeWindow(QWidget *parent) : QMainWindow(parent) {
+SefeWindow::SefeWindow(const QString &startPath, QWidget *parent) : QMainWindow(parent) {
     resize(960, 620);
+    // The HeDE app-chrome contract: the shared shell stylesheet
+    // (helm::styleSheet) tints #HelmAppWindow's menu bar, toolbar, address field,
+    // Places pane and status bar with the world glass — "the chrome is the world"
+    // — while the content body keeps the light/dark palette. SeFE is the template
+    // for any future xdg-toplevel HeDE app. See docs/design/seahorse-appearance.md.
+    setObjectName(QStringLiteral("HelmAppWindow"));
 
     // Read/write now (slice 3). Edits happen only via our actions — the views
     // use no edit triggers, so clicks/keys never start an inline rename by
@@ -89,6 +113,8 @@ SefeWindow::SefeWindow(QWidget *parent) : QMainWindow(parent) {
     bar->addSeparator();
 
     _address = new AddressBar(this);
+    _address->setObjectName(QStringLiteral("HelmAddressBar"));
+    _address->setAttribute(Qt::WA_StyledBackground, true); // let QSS paint the field
     connect(_address, &AddressBar::navigate, this,
             [this](const QString &dir) { navigateTo(dir); });
     bar->addWidget(_address);
@@ -96,8 +122,22 @@ SefeWindow::SefeWindow(QWidget *parent) : QMainWindow(parent) {
     connect(editShortcut, &QShortcut::activated, _address, &AddressBar::beginEdit);
 
     bar->addSeparator();
-    auto *viewAct = bar->addAction(QIcon::fromTheme(QStringLiteral("view-list-details")),
-                                   QStringLiteral("Toggle view"));
+    _viewToggleAct = bar->addAction(QIcon::fromTheme(QStringLiteral("view-list-details")),
+                                    QStringLiteral("Toggle view"));
+
+    // --- the Helm throbber, pinned top-right (Netscape's spot) ---
+    auto *spacer = new QWidget(this);
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    bar->addWidget(spacer);
+    _throbber = new HelmThrobber(this);
+    if (helm::Config().string(QStringLiteral("seahorse/throbber"),
+                              QStringLiteral("calm")).compare(
+            QStringLiteral("lively"), Qt::CaseInsensitive) == 0)
+        _throbber->setIntensity(HelmThrobber::Intensity::Lively);
+    // Clicking the throbber sails Home — like Netscape's throbber → home page.
+    connect(_throbber, &HelmThrobber::clicked, this,
+            [this] { navigateTo(QDir::homePath()); });
+    bar->addWidget(_throbber);
 
     // --- operation actions (shortcuts live window-wide; reused in menus) ---
     auto op = [this](const QString &text, const QKeySequence &keys, void (SefeWindow::*slot)()) {
@@ -137,9 +177,15 @@ SefeWindow::SefeWindow(QWidget *parent) : QMainWindow(parent) {
     _extractToAct = op(QStringLiteral("Extract to…"), QKeySequence(), &SefeWindow::extractTo);
     _compressAct = op(QStringLiteral("Compress to .zip"), QKeySequence(),
                       &SefeWindow::compressSelection);
-    auto *selectAllAct = op(QStringLiteral("Select all"), QKeySequence::SelectAll, nullptr);
-    connect(selectAllAct, &QAction::triggered, this,
+    _arcExtractSelAct = op(QStringLiteral("Extract Selected…"), QKeySequence(),
+                           &SefeWindow::extractSelectedEntries);
+    _arcExtractAllAct = op(QStringLiteral("Extract All…"), QKeySequence(),
+                           &SefeWindow::extractWholeArchive);
+    _selectAllAct = op(QStringLiteral("Select all"), QKeySequence::SelectAll, nullptr);
+    connect(_selectAllAct, &QAction::triggered, this,
             [this] { if (auto *v = activeView()) v->selectAll(); });
+
+    buildMenuBar(); // File/Edit/View/Go/Tools/Help over the same actions
 
     // --- details + icons views over the shared model ---
     auto initView = [this](QAbstractItemView *v) {
@@ -187,7 +233,7 @@ SefeWindow::SefeWindow(QWidget *parent) : QMainWindow(parent) {
     _viewStack = new QStackedWidget(this);
     _viewStack->addWidget(_details);
     _viewStack->addWidget(_icons);
-    connect(viewAct, &QAction::triggered, this, [this] {
+    connect(_viewToggleAct, &QAction::triggered, this, [this] {
         _viewStack->setCurrentIndex(_viewStack->currentIndex() == 0 ? 1 : 0);
         const QModelIndex root = _model->index(_current);
         _details->setRootIndex(root);
@@ -196,6 +242,7 @@ SefeWindow::SefeWindow(QWidget *parent) : QMainWindow(parent) {
 
     // --- places pane ---
     _places = new QListWidget(this);
+    _places->setObjectName(QStringLiteral("HelmAppPlaces")); // world-glass nav pane
     _places->setMaximumWidth(200);
     _places->setFrameShape(QFrame::NoFrame);
     for (const Place &p : places()) {
@@ -214,26 +261,329 @@ SefeWindow::SefeWindow(QWidget *parent) : QMainWindow(parent) {
     setCentralWidget(split);
 
     statusBar();
-    navigateTo(initialDir());
+    buildSceneChrome();
+    // Open the requested folder/archive (command line / file association), else Home.
+    navigateTo(startPath.isEmpty() ? initialDir() : QDir::cleanPath(startPath));
 }
 
 SefeWindow::~SefeWindow() {
     _model->setIconProvider(nullptr); // stop the model using it before we free it
     delete _iconProvider;
+    delete _archiveModel;
+    delete _extractTemp;
+}
+
+// The default menu bar. Every entry is one of the QActions already built in the
+// constructor, so the menu bar, the toolbar, and the right-click menu all drive
+// the same action (shortcuts stay in sync). Only two actions are menu-only: the
+// Menu Bar toggle and About.
+void SefeWindow::buildMenuBar() {
+    // Our own menu bar (not QMainWindow::menuBar()): buildSceneChrome() stacks it
+    // under the client titlebar inside the header widget via setMenuWidget().
+    _menuBar = new QMenuBar(this);
+    QMenuBar *mb = _menuBar;
+
+    QMenu *file = mb->addMenu(QStringLiteral("&File"));
+    file->addAction(_newFolderAct);
+    file->addAction(_openAct);
+    file->addAction(_openWithAct);
+    file->addSeparator();
+    file->addAction(_extractHereAct);
+    file->addAction(_extractToAct);
+    file->addAction(_compressAct);
+    file->addSeparator();
+    file->addAction(_propsAct);
+    QAction *closeAct = file->addAction(QStringLiteral("Close"));
+    closeAct->setShortcut(QKeySequence::Close); // Ctrl+W
+    connect(closeAct, &QAction::triggered, this, &QWidget::close);
+
+    QMenu *edit = mb->addMenu(QStringLiteral("&Edit"));
+    edit->addAction(_cutAct);
+    edit->addAction(_copyAct);
+    edit->addAction(_pasteAct);
+    edit->addSeparator();
+    edit->addAction(_renameAct);
+    edit->addAction(_deleteAct);
+    edit->addSeparator();
+    edit->addAction(_copyPathAct);
+    edit->addAction(_selectAllAct);
+
+    QMenu *view = mb->addMenu(QStringLiteral("&View"));
+    view->addAction(_viewToggleAct);
+    view->addAction(_refreshAct);
+    view->addSeparator();
+    _menuBarAct = view->addAction(QStringLiteral("Menu &Bar"));
+    _menuBarAct->setCheckable(true);
+    _menuBarAct->setChecked(true);
+    _menuBarAct->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_M));
+    connect(_menuBarAct, &QAction::toggled, mb, &QWidget::setVisible);
+    addAction(_menuBarAct); // window-wide, so Ctrl+M restores a hidden bar
+
+    QMenu *go = mb->addMenu(QStringLiteral("&Go"));
+    go->addAction(_backAct);
+    go->addAction(_fwdAct);
+    go->addAction(_upAct);
+    go->addSeparator();
+    for (const Place &p : places()) {
+        QAction *a = go->addAction(QIcon::fromTheme(p.icon), p.name);
+        const QString path = p.path;
+        connect(a, &QAction::triggered, this, [this, path] { navigateTo(path); });
+    }
+
+    QMenu *tools = mb->addMenu(QStringLiteral("&Tools"));
+    tools->addAction(_drydockAct);
+    tools->addAction(_shareAct);
+
+    QMenu *help = mb->addMenu(QStringLiteral("&Help"));
+    QAction *about = help->addAction(QStringLiteral("&About Seahorse"));
+    connect(about, &QAction::triggered, this, &SefeWindow::showAbout);
+}
+
+void SefeWindow::showAbout() {
+    QMessageBox::about(
+        this, QStringLiteral("About Seahorse"),
+        QStringLiteral("<b>Seahorse</b> — the Seahorse File Explorer (SeFE)<br>"
+                       "HeDE's native file manager.<br><br>"
+                       "Browse your hold — with archive browse-in-place, and "
+                       "Drydock / Gangway / Hold interop."));
+}
+
+// --- frameless scene chrome (Phase D) ---
+// "The chrome is the world, the content is glass." SeFE paints the active biome's
+// wallpaper across the whole window and floats an opaque body panel inset within,
+// so the scene forms one continuous painterly header + footer + side trim. Being
+// frameless, it also draws its own titlebar and drives move/resize.
+
+void SefeWindow::buildSceneChrome() {
+    setWindowFlag(Qt::FramelessWindowHint, true);
+    setAttribute(Qt::WA_TranslucentBackground, true);
+    setProperty("helmScene", true); // opt into the scene-mode QSS overrides
+
+    // Header: the client titlebar stacked above the menu bar, installed as the
+    // main window's menu widget so the real QMenuBar keeps working.
+    _titlebar = new HelmTitleBar(this);
+    _titlebar->setTitle(QStringLiteral("Seahorse"));
+    auto *header = new QWidget(this);
+    header->setObjectName(QStringLiteral("HelmHeader"));
+    auto *hv = new QVBoxLayout(header);
+    hv->setContentsMargins(0, 0, 0, 0);
+    hv->setSpacing(0);
+    hv->addWidget(_titlebar);
+    if (_menuBar)
+        hv->addWidget(_menuBar);
+    setMenuWidget(header);
+
+    // Inset the body so the scene shows as a thin trim down the sides and along the
+    // bottom; the body itself (#HelmAppBody) is an opaque panel that keeps the
+    // light/dark content readable over any scene.
+    if (QWidget *body = centralWidget()) {
+        body->setObjectName(QStringLiteral("HelmAppBody"));
+        body->setAttribute(Qt::WA_StyledBackground, true);
+        auto *inset = new QWidget(this);
+        inset->setObjectName(QStringLiteral("HelmAppBodyInset"));
+        auto *iv = new QVBoxLayout(inset);
+        iv->setContentsMargins(kResizeMargin, 3, kResizeMargin, kResizeMargin);
+        iv->addWidget(body);
+        setCentralWidget(inset); // reparents `body` into the inset container
+    }
+
+    setMouseTracking(true); // so the resize cursor updates as it crosses the trim
+    loadScene();
+}
+
+void SefeWindow::loadScene() {
+    const helm::Config cfg;
+    _accent = helm::effectiveAccent(cfg);
+    const helm::World world =
+        helm::loadWorld(cfg.string(QStringLiteral("world/id"), QStringLiteral("harbor")));
+    const QString path = world.wallpaperPath();
+    QPixmap scene;
+    if (!path.isEmpty())
+        scene.load(path);
+    _scene = scene;
+    update();
+}
+
+int SefeWindow::headerHeight() const {
+    // The top scene band: everything above the inset body (titlebar+menu+toolbar).
+    if (const QWidget *c = centralWidget())
+        return c->mapTo(this, QPoint(0, 0)).y();
+    return 100;
+}
+
+int SefeWindow::footerHeight() const {
+    // The bottom scene band: the status bar area below the inset body.
+    if (const QWidget *c = centralWidget()) {
+        const int bodyBottom = c->mapTo(this, QPoint(0, c->height())).y();
+        return qMax(0, height() - bodyBottom);
+    }
+    return 28;
+}
+
+Qt::Edges SefeWindow::resizeEdgeAt(const QPoint &pos) const {
+    Qt::Edges edges;
+    if (pos.x() <= kResizeMargin)
+        edges |= Qt::LeftEdge;
+    else if (pos.x() >= width() - kResizeMargin)
+        edges |= Qt::RightEdge;
+    if (pos.y() <= kResizeMargin)
+        edges |= Qt::TopEdge;
+    else if (pos.y() >= height() - kResizeMargin)
+        edges |= Qt::BottomEdge;
+    return edges;
+}
+
+void SefeWindow::paintEvent(QPaintEvent *event) {
+    QMainWindow::paintEvent(event);
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::SmoothPixmapTransform);
+
+    const QRectF r = rect();
+    constexpr qreal radius = 8.0;
+    QPainterPath clip;
+    clip.addRoundedRect(r, radius, radius);
+    p.setClipPath(clip);
+
+    // The world scene, cover-scaled and centred behind the whole window.
+    if (!_scene.isNull()) {
+        const QSize target = _scene.size().scaled(size(), Qt::KeepAspectRatioByExpanding);
+        const QPixmap scaled =
+            _scene.scaled(target, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+        p.drawPixmap(QPoint((width() - scaled.width()) / 2, (height() - scaled.height()) / 2),
+                     scaled);
+    } else {
+        p.fillRect(r, _accent.isValid() ? _accent : helm::barTint(helm::harborAccent()));
+    }
+
+    // Legibility scrims: darken the scene under the header and footer so the light
+    // chrome glyphs stay readable over any world.
+    const int hh = headerHeight();
+    if (hh > 0) {
+        QLinearGradient top(0, 0, 0, hh);
+        top.setColorAt(0.0, QColor(0, 0, 0, 155));
+        top.setColorAt(1.0, QColor(0, 0, 0, 0));
+        p.fillRect(QRectF(0, 0, width(), hh), top);
+    }
+    const int fh = footerHeight();
+    if (fh > 0) {
+        QLinearGradient bot(0, height() - fh, 0, height());
+        bot.setColorAt(0.0, QColor(0, 0, 0, 0));
+        bot.setColorAt(1.0, QColor(0, 0, 0, 140));
+        p.fillRect(QRectF(0, height() - fh, width(), fh), bot);
+    }
+
+    // A hairline edge to define the rounded window against the desktop.
+    p.setClipping(false);
+    p.setBrush(Qt::NoBrush);
+    p.setPen(QPen(QColor(255, 255, 255, 46), 1.0));
+    p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius);
+}
+
+void SefeWindow::mousePressEvent(QMouseEvent *event) {
+    // A press on the scene trim starts an interactive resize (frameless windows
+    // have no server-side resize border); the titlebar handles move.
+    if (event->button() == Qt::LeftButton) {
+        const Qt::Edges edges = resizeEdgeAt(event->pos());
+        if (edges) {
+            if (QWindow *handle = windowHandle()) {
+                handle->startSystemResize(edges);
+                return;
+            }
+        }
+    }
+    QMainWindow::mousePressEvent(event);
+}
+
+void SefeWindow::mouseMoveEvent(QMouseEvent *event) {
+    const Qt::Edges e = resizeEdgeAt(event->pos());
+    Qt::CursorShape shape = Qt::ArrowCursor;
+    if (((e & Qt::TopEdge) && (e & Qt::LeftEdge)) || ((e & Qt::BottomEdge) && (e & Qt::RightEdge)))
+        shape = Qt::SizeFDiagCursor;
+    else if (((e & Qt::TopEdge) && (e & Qt::RightEdge)) ||
+             ((e & Qt::BottomEdge) && (e & Qt::LeftEdge)))
+        shape = Qt::SizeBDiagCursor;
+    else if (e & (Qt::LeftEdge | Qt::RightEdge))
+        shape = Qt::SizeHorCursor;
+    else if (e & (Qt::TopEdge | Qt::BottomEdge))
+        shape = Qt::SizeVerCursor;
+    setCursor(shape);
+    QMainWindow::mouseMoveEvent(event);
+}
+
+template <class Work, class Done>
+void SefeWindow::runBusy(const QString &activity, Work work, Done done) {
+    _throbber->begin(activity);
+    auto *thread = QThread::create(
+        [this, work = std::move(work), done = std::move(done)]() mutable {
+            auto payload = work(); // hold-core runs here, off the UI thread
+            // Deliver the result on the UI thread. If the window is gone by now,
+            // Qt drops this queued call (receiver destroyed) — no dangling use.
+            QMetaObject::invokeMethod(
+                this,
+                [this, payload = std::move(payload), done = std::move(done)]() mutable {
+                    done(payload);
+                    _throbber->end();
+                },
+                Qt::QueuedConnection);
+        });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
 }
 
 // --- navigation ---
 
 void SefeWindow::navigateTo(const QString &dir, bool record) {
     const QString path = QDir::cleanPath(dir);
-    _current = path;
-    _model->setRootPath(path);
-    const QModelIndex root = _model->index(path);
-    _details->setRootIndex(root);
-    _icons->setRootIndex(root);
+    const ArchiveSplit split = splitArchivePath(path);
 
+    // Switch both views to `m` (only when it actually changes, to keep the
+    // details columns) then root them at `root`.
+    auto useModel = [this](QAbstractItemModel *m, const QModelIndex &root) {
+        if (_details->model() != m) {
+            _details->setModel(m);
+            _icons->setModel(m);
+            _details->setColumnWidth(0, 320);
+            _details->header()->setStretchLastSection(true);
+        }
+        _details->setRootIndex(root);
+        _icons->setRootIndex(root);
+    };
+
+    if (split.archive.isEmpty()) { // filesystem
+        _inArchive = false;
+        _model->setRootPath(path);
+        useModel(_model, _model->index(path));
+        if (_archiveModel) { // left the archive — drop its model
+            delete _archiveModel;
+            _archiveModel = nullptr;
+        }
+    } else { // inside an archive
+        if (!_archiveModel || _archiveModel->archivePath() != split.archive) {
+            // Loading a NEW archive reads its table of contents. It's synchronous
+            // (near-instant for a zip), so we don't off-thread it — but pulse the
+            // throbber so the load registers: begin/end here spins it one full loop
+            // (it idles on, and settles back to, tonight's moon) via runBusy's
+            // refcounted animator. Navigating within an already-open archive skips
+            // this — no re-read.
+            _throbber->begin(
+                QStringLiteral("Reading %1…").arg(QFileInfo(split.archive).fileName()));
+            helm::hold::ArchiveModel *old = _archiveModel;
+            _archiveModel = new helm::hold::ArchiveModel(split.archive);
+            useModel(_archiveModel, _archiveModel->indexForInner(split.inner));
+            delete old; // views no longer reference it
+            _throbber->end();
+        } else {
+            useModel(_archiveModel, _archiveModel->indexForInner(split.inner));
+        }
+        _inArchive = true;
+    }
+
+    _current = path;
     _address->setPath(path);
     setWindowTitle(helm::sefe::windowTitle(path));
+    if (_titlebar) // frameless: mirror the title into the client titlebar
+        _titlebar->setTitle(helm::sefe::windowTitle(path));
     highlightPlace(path);
     statusBar()->showMessage(path);
 
@@ -249,13 +599,49 @@ void SefeWindow::navigateTo(const QString &dir, bool record) {
 void SefeWindow::openIndex(const QModelIndex &index) {
     if (!index.isValid())
         return;
+    if (_inArchive && _archiveModel) { // inside an archive
+        const QString inner = _archiveModel->innerPath(index);
+        if (_archiveModel->isDir(index))
+            navigateTo(_archiveModel->archivePath() + QLatin1Char('/') + inner);
+        else
+            openArchiveEntry(inner);
+        return;
+    }
     const QString path = _model->filePath(index);
     if (_model->isDir(index))
         navigateTo(path);
     else if (isWindowsExecutable(path))
         helm::launchDetached(QStringLiteral("drydock"), {QStringLiteral("open"), path});
+    else if (helm::hold::isArchive(path))
+        navigateTo(path); // walk into the archive (browse-in-place)
     else
         QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+}
+
+void SefeWindow::openArchiveEntry(const QString &inner) {
+    if (!_archiveModel)
+        return;
+    if (!_extractTemp)
+        _extractTemp = new QTemporaryDir; // session-lifetime scratch for opened entries
+    if (!_extractTemp->isValid())
+        return;
+    const QString archive = _archiveModel->archivePath();
+    const QString tempDir = _extractTemp->path();
+    // Extract the one entry on a worker thread (the throbber spins), then open
+    // it once it lands.
+    runBusy(
+        QStringLiteral("Opening %1…").arg(QFileInfo(inner).fileName()),
+        [archive, inner, tempDir]() -> QString {
+            const helm::hold::Result r = helm::hold::extract(archive, inner, tempDir);
+            return r.ok ? QString() : r.error; // empty == success
+        },
+        [this, inner, tempDir](const QString &error) {
+            if (error.isEmpty())
+                QDesktopServices::openUrl(
+                    QUrl::fromLocalFile(QDir(tempDir).filePath(inner)));
+            else
+                statusBar()->showMessage(QStringLiteral("Open failed: %1").arg(error));
+        });
 }
 
 void SefeWindow::goBack() {
@@ -298,6 +684,8 @@ QAbstractItemView *SefeWindow::activeView() const {
 
 QStringList SefeWindow::selectedPaths() const {
     QStringList out;
+    if (_inArchive)
+        return out; // archive browsing is read-only — filesystem ops don't apply
     QAbstractItemView *v = activeView();
     if (!v || !v->selectionModel())
         return out;
@@ -317,8 +705,21 @@ void SefeWindow::renameSelected() {
 }
 
 void SefeWindow::deleteSelected() {
-    for (const QString &p : selectedPaths())
-        QFile::moveToTrash(p); // Del → Trash (reversible), Windows-style
+    const QStringList paths = selectedPaths();
+    if (paths.isEmpty())
+        return;
+    // Off the UI thread (throbber spins): trashing a big tree — or anything on a
+    // slow/network mount — mustn't freeze the window. Del → Trash, Windows-style.
+    runBusy(
+        QStringLiteral("Deleting %1 item(s)…").arg(paths.size()),
+        [paths]() -> QString {
+            int ok = 0;
+            for (const QString &p : paths)
+                if (QFile::moveToTrash(p))
+                    ++ok;
+            return QStringLiteral("Moved %1 item(s) to Trash").arg(ok);
+        },
+        [this](const QString &msg) { statusBar()->showMessage(msg); });
 }
 
 void SefeWindow::copySelected(bool cut) {
@@ -334,31 +735,45 @@ void SefeWindow::copySelected(bool cut) {
 }
 
 void SefeWindow::paste() {
-    if (_clip.isEmpty())
+    if (_clip.isEmpty() || _inArchive) // can't paste into a read-only archive view
         return;
-    const QDir dest(_current);
-    QSet<QString> existing = entriesOf(_current);
-    for (const QString &src : _clip) {
-        const QString base = QFileInfo(src).fileName();
-        if (_clipCut && QFileInfo(src).absolutePath() == _current)
-            continue; // cut + paste into the same folder is a no-op
-        // Disambiguate on any name collision. A copy into the source's own folder
-        // collides because the source itself is already in `existing` → "x - Copy".
-        QString name = base;
-        if (existing.contains(name))
-            name = copyName(base, existing);
-        existing.insert(name);
-        const QString target = dest.filePath(name);
-        if (_clipCut)
-            moveItem(src, target);
-        else
-            copyRecursively(src, target);
-    }
-    if (_clipCut) {
-        _clip.clear();
-        _clipCut = false;
-        _pasteAct->setEnabled(false);
-    }
+    const QStringList clip = _clip;
+    const bool cut = _clipCut;
+    const QString dest = _current;
+    // Copy/move runs off the UI thread (throbber spins): a large tree — or a
+    // slow/network target — would otherwise freeze the window.
+    runBusy(
+        cut ? QStringLiteral("Moving %1 item(s)…").arg(clip.size())
+            : QStringLiteral("Copying %1 item(s)…").arg(clip.size()),
+        [clip, cut, dest]() -> QString {
+            const QDir destDir(dest);
+            QSet<QString> existing = entriesOf(dest);
+            int ok = 0;
+            for (const QString &src : clip) {
+                const QString base = QFileInfo(src).fileName();
+                if (cut && QFileInfo(src).absolutePath() == dest)
+                    continue; // cut + paste into the same folder is a no-op
+                // Disambiguate on any name collision. A copy into the source's own
+                // folder collides (the source is already in `existing`) → "x - Copy".
+                QString name = base;
+                if (existing.contains(name))
+                    name = copyName(base, existing);
+                existing.insert(name);
+                const QString target = destDir.filePath(name);
+                if (cut ? moveItem(src, target) : copyRecursively(src, target))
+                    ++ok;
+            }
+            return (cut ? QStringLiteral("Moved %1 item(s)") : QStringLiteral("Copied %1 item(s)"))
+                .arg(ok);
+        },
+        [this, cut](const QString &msg) {
+            statusBar()->showMessage(msg);
+            if (cut) { // a move consumes the clipboard
+                _clip.clear();
+                _clipCut = false;
+                _pasteAct->setEnabled(false);
+            }
+        });
 }
 
 void SefeWindow::newFolder() {
@@ -487,15 +902,29 @@ void SefeWindow::copyPaths() {
 // off-thread pass is a later polish; large archives will block until then.
 
 void SefeWindow::extractHere() {
-    for (const QString &archive : selectedPaths()) {
-        if (!helm::hold::isArchive(archive))
-            continue;
-        const helm::hold::Result r = helm::hold::extractAll(archive, _current);
-        statusBar()->showMessage(r.ok ? QStringLiteral("Extracted %1").arg(QFileInfo(archive).fileName())
-                                      : QStringLiteral("Extract failed: %1").arg(r.error));
-        if (!r.ok)
-            return;
-    }
+    QStringList archives;
+    for (const QString &p : selectedPaths())
+        if (helm::hold::isArchive(p))
+            archives << p;
+    if (archives.isEmpty())
+        return;
+    const QString dest = _current;
+    runBusy(
+        archives.size() == 1
+            ? QStringLiteral("Extracting %1…").arg(QFileInfo(archives.first()).fileName())
+            : QStringLiteral("Extracting %1 archives…").arg(archives.size()),
+        [archives, dest]() -> QString {
+            int ok = 0;
+            for (const QString &archive : archives) {
+                const helm::hold::Result r = helm::hold::extractAll(archive, dest);
+                if (!r.ok)
+                    return QStringLiteral("Extract failed: %1").arg(r.error);
+                ++ok;
+            }
+            return ok == 1 ? QStringLiteral("Extracted %1").arg(QFileInfo(archives.first()).fileName())
+                           : QStringLiteral("Extracted %1 archives").arg(ok);
+        },
+        [this](const QString &msg) { statusBar()->showMessage(msg); });
 }
 
 void SefeWindow::extractTo() {
@@ -507,9 +936,80 @@ void SefeWindow::extractTo() {
         QFileDialog::getExistingDirectory(this, QStringLiteral("Extract to"), _current);
     if (dest.isEmpty())
         return;
-    const helm::hold::Result r = helm::hold::extractAll(*it, dest);
-    statusBar()->showMessage(r.ok ? QStringLiteral("Extracted to %1").arg(dest)
-                                  : QStringLiteral("Extract failed: %1").arg(r.error));
+    const QString archive = *it;
+    runBusy(
+        QStringLiteral("Extracting %1…").arg(QFileInfo(archive).fileName()),
+        [archive, dest]() -> QString {
+            const helm::hold::Result r = helm::hold::extractAll(archive, dest);
+            return r.ok ? QStringLiteral("Extracted to %1").arg(dest)
+                        : QStringLiteral("Extract failed: %1").arg(r.error);
+        },
+        [this](const QString &msg) { statusBar()->showMessage(msg); });
+}
+
+// Rich archive ops, folded in from the former standalone Hold app: while browsing
+// inside an archive, extract entries straight to a chosen folder. hold-core runs
+// off the UI thread via runBusy so a big archive doesn't freeze the window.
+
+QStringList SefeWindow::selectedInnerEntries() const {
+    QStringList out;
+    if (!_inArchive || !_archiveModel)
+        return out;
+    QAbstractItemView *v = activeView();
+    if (!v || !v->selectionModel())
+        return out;
+    for (const QModelIndex &idx : v->selectionModel()->selectedIndexes()) {
+        if (idx.column() != 0)
+            continue;
+        const QString inner = _archiveModel->innerPath(idx);
+        if (!inner.isEmpty())
+            out << inner;
+    }
+    return out;
+}
+
+void SefeWindow::extractSelectedEntries() {
+    if (!_inArchive || !_archiveModel)
+        return;
+    const QStringList entries = selectedInnerEntries();
+    if (entries.isEmpty())
+        return;
+    const QString dest =
+        QFileDialog::getExistingDirectory(this, QStringLiteral("Extract selected to"), _current);
+    if (dest.isEmpty())
+        return;
+    const QString archive = _archiveModel->archivePath();
+    runBusy(
+        QStringLiteral("Extracting %1 item(s)…").arg(entries.size()),
+        [archive, entries, dest]() -> QString {
+            int ok = 0;
+            for (const QString &inner : entries)
+                if (helm::hold::extract(archive, inner, dest).ok)
+                    ++ok;
+            return QStringLiteral("Extracted %1 of %2 to %3")
+                .arg(ok)
+                .arg(entries.size())
+                .arg(dest);
+        },
+        [this](const QString &msg) { statusBar()->showMessage(msg); });
+}
+
+void SefeWindow::extractWholeArchive() {
+    if (!_inArchive || !_archiveModel)
+        return;
+    const QString archive = _archiveModel->archivePath();
+    const QString dest =
+        QFileDialog::getExistingDirectory(this, QStringLiteral("Extract all to"), _current);
+    if (dest.isEmpty())
+        return;
+    runBusy(
+        QStringLiteral("Extracting %1…").arg(QFileInfo(archive).fileName()),
+        [archive, dest]() -> QString {
+            const helm::hold::Result r = helm::hold::extractAll(archive, dest);
+            return r.ok ? QStringLiteral("Extracted to %1").arg(dest)
+                        : QStringLiteral("Extract failed: %1").arg(r.error);
+        },
+        [this](const QString &msg) { statusBar()->showMessage(msg); });
 }
 
 void SefeWindow::compressSelection() {
@@ -518,14 +1018,30 @@ void SefeWindow::compressSelection() {
         return;
     const QString name = compressTargetName(sel, entriesOf(_current));
     const QString dest = QDir(_current).filePath(name);
-    const helm::hold::Result r = helm::hold::create(sel, dest);
-    statusBar()->showMessage(r.ok ? QStringLiteral("Created %1").arg(name)
-                                  : QStringLiteral("Compress failed: %1").arg(r.error));
+    runBusy(
+        QStringLiteral("Compressing to %1…").arg(name),
+        [sel, dest, name]() -> QString {
+            const helm::hold::Result r = helm::hold::create(sel, dest);
+            return r.ok ? QStringLiteral("Created %1").arg(name)
+                        : QStringLiteral("Compress failed: %1").arg(r.error);
+        },
+        [this](const QString &msg) { statusBar()->showMessage(msg); });
 }
 
 void SefeWindow::showContextMenu(QAbstractItemView *view, const QPoint &pos) {
     const QModelIndex idx = view->indexAt(pos);
     QMenu menu(this);
+    if (_inArchive) { // browse read-only, but extract entries out (folded-in Hold)
+        if (idx.isValid()) {
+            QAction *open = menu.addAction(QStringLiteral("Open"));
+            connect(open, &QAction::triggered, this, [this, idx] { openIndex(idx); });
+            menu.addSeparator();
+            menu.addAction(_arcExtractSelAct); // extract the selected entries
+        }
+        menu.addAction(_arcExtractAllAct);     // extract the whole archive
+        menu.exec(view->viewport()->mapToGlobal(pos));
+        return;
+    }
     if (idx.isValid()) {
         const bool isDir = _model->isDir(idx);
         const QString path = _model->filePath(idx);
